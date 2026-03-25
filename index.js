@@ -13,214 +13,251 @@ app.use(cors());
 // User-Agent de Chrome para evitar bloqueos
 const CHROME_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
-// Ruta principal - información del servicio
+// ============================================
+// STREAMS DE PRUEBA ESTABLES (SomaFM - GRATIS)
+// ============================================
+const STABLE_STREAMS = {
+  'groovesalad': {
+    name: 'Groove Salad',
+    url: 'https://ice1.somafm.com/groovesalad-128-mp3',
+    genre: 'Ambient Chill',
+    description: 'Ambient beats and grooves'
+  },
+  'dronezone': {
+    name: 'Drone Zone',
+    url: 'https://ice1.somafm.com/dronezone-128-mp3',
+    genre: 'Ambient',
+    description: 'Deep atmospheric drones'
+  },
+  'secretagent': {
+    name: 'Secret Agent',
+    url: 'https://ice1.somafm.com/secretagent-128-mp3',
+    genre: 'Soundtracks',
+    description: 'Spy movie soundtracks'
+  },
+  'indiepop': {
+    name: 'Indie Pop Rocks',
+    url: 'https://ice1.somafm.com/indiepop-128-mp3',
+    genre: 'Indie Pop',
+    description: 'Independent pop music'
+  },
+  'defcon': {
+    name: 'DEF CON Radio',
+    url: 'https://ice1.somafm.com/defcon-128-mp3',
+    genre: 'Electronic',
+    description: 'Music from DEF CON'
+  }
+};
+
+// Ruta principal - información del servicio con streams de prueba
 app.get('/', (req, res) => {
   res.json({
     service: 'Audio Relay Service',
-    version: '2.0.0',
+    version: '3.0.0',
     description: 'Micro-servicio de relay para streams de audio/radio',
     usage: '/relay?url=<audio-stream-url>',
     example: '/relay?url=http://example.com:8000/stream',
-    features: ['chunked streaming', 'keep-alive', 'CORS enabled']
+    testStreams: STABLE_STREAMS,
+    quickTest: [
+      '/test/groovesalad',
+      '/test/dronezone', 
+      '/test/secretagent'
+    ]
   });
 });
 
-// Función para hacer el request de streaming usando http/https nativo
-function createStreamRequest(streamUrl, onResponse, onError) {
-  const parsedUrl = new URL(streamUrl);
-  const isHttps = parsedUrl.protocol === 'https:';
-  const lib = isHttps ? https : http;
-
-  const options = {
-    hostname: parsedUrl.hostname,
-    port: parsedUrl.port || (isHttps ? 443 : 80),
-    path: parsedUrl.pathname + parsedUrl.search,
-    method: 'GET',
-    headers: {
-      'User-Agent': CHROME_USER_AGENT,
-      'Accept': '*/*',
-      'Accept-Encoding': 'identity',
-      'Connection': 'keep-alive',
-      'Icy-MetaData': '1',
-      'Cache-Control': 'no-cache',
-      'Pragma': 'no-cache'
-    },
-    timeout: 30000,
-    // Keep-alive settings
-    agent: new lib.Agent({
-      keepAlive: true,
-      keepAliveMsecs: 30000,
-      maxSockets: 100,
-      maxFreeSockets: 10
-    })
-  };
-
-  const req = lib.request(options, onResponse);
-  
-  req.on('error', onError);
-  
-  req.on('timeout', () => {
-    console.error('[Stream] Timeout en request');
-    req.destroy();
+// Rutas de prueba rápida con streams estables
+Object.keys(STABLE_STREAMS).forEach(key => {
+  app.get(`/test/${key}`, (req, res) => {
+    const stream = STABLE_STREAMS[key];
+    relayStream(stream.url, req, res);
   });
+});
 
-  req.end();
-  
-  return req;
-}
-
-// Ruta de relay para streams de audio
-app.get('/relay', async (req, res) => {
-  const { url } = req.query;
-
-  // Validar que se proporcionó una URL
-  if (!url) {
-    return res.status(400).json({
-      error: 'URL requerida',
-      usage: '/relay?url=<audio-stream-url>'
-    });
-  }
-
+// Función principal de relay mejorada
+function relayStream(streamUrl, req, res) {
   let upstreamReq = null;
   let upstreamRes = null;
   let clientDisconnected = false;
+  let bytesSent = 0;
 
   // Manejar desconexión del cliente
-  req.on('close', () => {
+  const onClientClose = () => {
     console.log('[Relay] Cliente desconectado');
     clientDisconnected = true;
-    if (upstreamReq) {
-      upstreamReq.destroy();
-    }
-  });
+    cleanup();
+  };
 
+  const cleanup = () => {
+    if (upstreamReq) {
+      try { upstreamReq.destroy(); } catch (e) {}
+      upstreamReq = null;
+    }
+    if (upstreamRes) {
+      try { upstreamRes.destroy(); } catch (e) {}
+      upstreamRes = null;
+    }
+  };
+
+  req.on('close', onClientClose);
   req.on('error', (err) => {
-    console.error('[Relay] Error en request del cliente:', err.message);
+    console.error('[Relay] Error cliente:', err.message);
     clientDisconnected = true;
+    cleanup();
   });
 
   try {
-    // Decodificar la URL si viene codificada
-    const decodedUrl = decodeURIComponent(url);
+    const decodedUrl = decodeURIComponent(streamUrl);
     console.log(`[Relay] Conectando a: ${decodedUrl}`);
 
-    upstreamReq = createStreamRequest(
-      decodedUrl,
-      (proxyRes) => {
-        if (clientDisconnected) {
-          proxyRes.destroy();
-          return;
-        }
+    const parsedUrl = new URL(decodedUrl);
+    const isHttps = parsedUrl.protocol === 'https:';
+    const lib = isHttps ? https : http;
 
-        upstreamRes = proxyRes;
-        
-        // Detectar el Content-Type del stream
-        const contentType = proxyRes.headers['content-type'] || 'audio/mpeg';
-        
-        console.log(`[Relay] Stream conectado - Status: ${proxyRes.statusCode}, Content-Type: ${contentType}`);
-
-        // Verificar status OK
-        if (proxyRes.statusCode !== 200) {
-          if (!res.headersSent) {
-            res.status(proxyRes.statusCode).json({ 
-              error: 'Error del servidor de origen',
-              status: proxyRes.statusCode 
-            });
-          }
-          return;
-        }
-
-        // Configurar headers de respuesta CRÍTICOS para streaming real
-        res.setHeader('Access-Control-Allow-Origin', '*');
-        res.setHeader('Connection', 'keep-alive');
-        res.setHeader('Content-Type', contentType);
-        
-        // CRITICAL: Desactivar cache completamente
-        res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate, max-age=0');
-        res.setHeader('Pragma', 'no-cache');
-        res.setHeader('Expires', '0');
-        res.setHeader('X-Content-Type-Options', 'nosniff');
-        
-        // Reenviar headers ICY del stream original
-        const icyHeaders = ['icy-name', 'icy-genre', 'icy-br', 'icy-url', 'icy-metaint', 'icy-pub'];
-        icyHeaders.forEach(header => {
-          if (proxyRes.headers[header]) {
-            res.setHeader(header, proxyRes.headers[header]);
-          }
-        });
-
-        console.log(`[Relay] Iniciando pipe del stream`);
-
-        // Pipe directo sin buffering
-        proxyRes.pipe(res);
-
-        // Manejar eventos del stream
-        proxyRes.on('error', (err) => {
-          console.error('[Relay] Error en upstream:', err.message);
-          if (!res.headersSent) {
-            res.status(502).json({ error: 'Error en stream de origen' });
-          }
-        });
-
-        proxyRes.on('end', () => {
-          console.log('[Relay] Stream finalizado por origen');
-        });
-
-        proxyRes.on('close', () => {
-          console.log('[Relay] Conexión cerrada por origen');
-        });
+    const options = {
+      hostname: parsedUrl.hostname,
+      port: parsedUrl.port || (isHttps ? 443 : 80),
+      path: parsedUrl.pathname + parsedUrl.search,
+      method: 'GET',
+      headers: {
+        'User-Agent': CHROME_USER_AGENT,
+        'Accept': 'audio/*,*/*',
+        'Accept-Encoding': 'identity',
+        'Connection': 'close', // IMPORTANTE: no keep-alive para streams
+        'Icy-MetaData': '1'
       },
-      (err) => {
-        console.error('[Relay] Error conectando:', err.message);
-        if (!res.headersSent && !clientDisconnected) {
-          if (err.code === 'ENOTFOUND') {
-            res.status(502).json({ error: 'No se pudo resolver el host de origen' });
-          } else if (err.code === 'ECONNREFUSED') {
-            res.status(502).json({ error: 'Conexión rechazada por el servidor de origen' });
-          } else if (err.code === 'ETIMEDOUT') {
-            res.status(504).json({ error: 'Timeout conectando al servidor de origen' });
-          } else {
-            res.status(502).json({ error: 'Error conectando al stream de origen', details: err.message });
-          }
-        }
+      timeout: 30000
+      // SIN agent keep-alive - permite que cada conexión sea independiente
+    };
+
+    upstreamReq = lib.request(options, (proxyRes) => {
+      if (clientDisconnected) {
+        proxyRes.destroy();
+        return;
       }
-    );
+
+      upstreamRes = proxyRes;
+
+      const contentType = proxyRes.headers['content-type'] || 'audio/mpeg';
+      console.log(`[Relay] Status: ${proxyRes.statusCode}, Content-Type: ${contentType}`);
+
+      if (proxyRes.statusCode !== 200) {
+        if (!res.headersSent) {
+          res.status(proxyRes.statusCode).json({ 
+            error: 'Error del servidor de origen',
+            status: proxyRes.statusCode 
+          });
+        }
+        return;
+      }
+
+      // Headers de respuesta
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Content-Type', contentType);
+      res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+      res.setHeader('Pragma', 'no-cache');
+      res.setHeader('Expires', '0');
+      
+      // Reenviar headers ICY
+      const icyHeaders = ['icy-name', 'icy-genre', 'icy-br', 'icy-url', 'icy-metaint', 'icy-pub', 'icy-notice1', 'icy-notice2'];
+      icyHeaders.forEach(header => {
+        if (proxyRes.headers[header]) {
+          res.setHeader(header, proxyRes.headers[header]);
+        }
+      });
+
+      console.log(`[Relay] Iniciando stream...`);
+
+      // Pipe con monitoreo
+      proxyRes.on('data', (chunk) => {
+        bytesSent += chunk.length;
+      });
+
+      proxyRes.pipe(res);
+
+      proxyRes.on('error', (err) => {
+        console.error('[Relay] Error upstream:', err.message);
+        if (!res.headersSent) {
+          res.status(502).json({ error: 'Error en stream de origen' });
+        }
+      });
+
+      proxyRes.on('end', () => {
+        console.log(`[Relay] Stream terminado. Total: ${(bytesSent / 1024).toFixed(1)} KB`);
+      });
+
+      proxyRes.on('close', () => {
+        console.log('[Relay] Conexión cerrada por origen');
+        if (!res.writableEnded && !clientDisconnected) {
+          res.end();
+        }
+      });
+    });
+
+    upstreamReq.on('error', (err) => {
+      console.error('[Relay] Error conectando:', err.message);
+      if (!res.headersSent && !clientDisconnected) {
+        const errorMsg = err.code === 'ENOTFOUND' ? 'Host no encontrado' :
+                        err.code === 'ECONNREFUSED' ? 'Conexión rechazada' :
+                        err.code === 'ETIMEDOUT' ? 'Timeout' : err.message;
+        res.status(502).json({ error: errorMsg });
+      }
+    });
+
+    upstreamReq.on('timeout', () => {
+      console.error('[Relay] Timeout');
+      upstreamReq.destroy();
+    });
+
+    upstreamReq.end();
 
   } catch (error) {
-    console.error('[Relay] Error general:', error.message);
+    console.error('[Relay] Error:', error.message);
     if (!res.headersSent && !clientDisconnected) {
-      res.status(500).json({ error: 'Error interno del servidor' });
+      res.status(500).json({ error: 'Error interno' });
     }
   }
+}
+
+// Ruta de relay genérica
+app.get('/relay', (req, res) => {
+  const { url } = req.query;
+
+  if (!url) {
+    return res.status(400).json({
+      error: 'URL requerida',
+      usage: '/relay?url=<audio-stream-url>',
+      quickTest: '/test/groovesalad'
+    });
+  }
+
+  relayStream(url, req, res);
 });
 
-// Health check para servicios de monitoreo
+// Health check
 app.get('/health', (req, res) => {
   res.status(200).json({ 
     status: 'ok', 
     timestamp: new Date().toISOString(),
-    uptime: process.uptime()
+    uptime: Math.floor(process.uptime()) + 's'
   });
 });
 
-// Manejador de errores global - el servidor NUNCA debe caerse
+// Manejadores de errores globales
 process.on('uncaughtException', (err) => {
   console.error('[Global] Error no capturado:', err.message);
-  // No hacer process.exit() - mantener el servidor vivo
 });
 
-process.on('unhandledRejection', (reason, promise) => {
+process.on('unhandledRejection', (reason) => {
   console.error('[Global] Promesa rechazada:', reason);
-  // No hacer process.exit() - mantener el servidor vivo
 });
 
 // Iniciar servidor
-const server = app.listen(PORT, () => {
-  console.log(`🎙️ Audio Relay Service corriendo en puerto ${PORT}`);
-  console.log(`📡 Listo para retransmitir streams de audio`);
-  console.log(`🔧 Version 2.0.0 - Streaming con http nativo`);
+const server = app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🎙️ Audio Relay Service v3.0.0 en puerto ${PORT}`);
+  console.log(`📡 Streams de prueba: /test/groovesalad, /test/dronezone, /test/secretagent`);
 });
 
-// Configurar timeouts del servidor
-server.keepAliveTimeout = 65000; // Más tiempo que el load balancer
-server.headersTimeout = 66000; // Un poco más que keepAliveTimeout
+// Timeouts extendidos
+server.keepAliveTimeout = 120000;
+server.headersTimeout = 121000;
