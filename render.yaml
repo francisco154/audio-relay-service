@@ -1,0 +1,8 @@
+services:
+  - type: web
+    name: f14-desktop
+    env: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    repo: https://github.com/francisco154/f14-desktop
+    branch: main
